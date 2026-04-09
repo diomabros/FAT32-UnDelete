@@ -3,6 +3,7 @@
 
 #![allow(dead_code)]
 
+mod ai;
 mod fat32;
 mod gui;
 mod i18n;
@@ -77,9 +78,8 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
-    // Detect and set the UI language from OS locale
-    let lang = i18n::detect_system_language();
-    i18n::set_language(lang);
+    // Detect and set the UI language from OS locale (auto-detected in i18n::init)
+    // Language is automatically detected on first use of i18n.
 
     let cli = Cli::parse();
 
@@ -107,16 +107,17 @@ fn main() -> Result<()> {
         .with_context(|| format!("failed to open '{}'", source))?;
 
     // Parse BPB
-    println!("{}", i18n::tr().parsing_boot_sector);
+    println!("{}", i18n::tr("parsing_boot_sector"));
     let bpb = fat32::bpb::Bpb::parse(reader.as_ref())?;
+    let vol_label = if bpb.volume_label.is_empty() {
+        i18n::tr("none_label")
+    } else {
+        bpb.volume_label.clone()
+    };
     println!(
         "{}",
         i18n::cli_volume_info(
-            if bpb.volume_label.is_empty() {
-                i18n::tr().none_label
-            } else {
-                &bpb.volume_label
-            },
+            &vol_label,
             bpb.bytes_per_sector,
             bpb.cluster_size,
             bpb.total_data_clusters,
@@ -124,7 +125,7 @@ fn main() -> Result<()> {
     );
 
     // Load FAT tables
-    println!("{}", i18n::tr().loading_fat_tables);
+    println!("{}", i18n::tr("loading_fat_tables"));
     let fat = fat32::fat_table::FatTables::load(reader.as_ref(), &bpb)?;
     let divergent = fat.divergent_count();
     if divergent > 0 {
@@ -140,8 +141,8 @@ fn main() -> Result<()> {
     // --- Directory scan ---
     let mut recovered = Vec::new();
     if matches!(cli.mode, Mode::Scan | Mode::All) {
-        println!("{}", i18n::tr().scanning_directories);
-        recovered = recovery::dir_scan::scan_deleted(reader.as_ref(), &bpb, &fat)?;
+        println!("{}", i18n::tr("scanning_directories"));
+        recovered = recovery::dir_scan::scan_deleted(reader.as_ref(), &bpb, &fat, None)?;
 
         // Apply size filters
         if let Some(min) = cli.min_size {
@@ -155,9 +156,9 @@ fn main() -> Result<()> {
     // --- Carving ---
     let mut carved = Vec::new();
     if matches!(cli.mode, Mode::Carve | Mode::All) {
-        println!("{}", i18n::tr().carving_clusters);
+        println!("{}", i18n::tr("carving_clusters"));
         carved =
-            recovery::carver::carve_files(reader.as_ref(), &bpb, &fat, &signatures)?;
+            recovery::carver::carve_files(reader.as_ref(), &bpb, &fat, &signatures, None)?;
 
         // Apply size filters to carved files too
         if let Some(min) = cli.min_size {
@@ -172,7 +173,7 @@ fn main() -> Result<()> {
     if cli.list || cli.dry_run {
         output::print_summary(&recovered, &carved, 0, 0);
         if cli.dry_run {
-            println!("\n{}", i18n::tr().dry_run_note);
+            println!("\n{}", i18n::tr("dry_run_note"));
         }
         return Ok(());
     }

@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 
+use crate::ai::{self, AiEngine};
 use crate::fat32::bpb::Bpb;
 use crate::fat32::dir_entry;
 use crate::fat32::fat_table::FatTables;
@@ -14,6 +15,7 @@ pub fn scan_deleted(
     reader: &dyn DiskReader,
     bpb: &Bpb,
     fat: &FatTables,
+    ai_engine: Option<&AiEngine>,
 ) -> Result<Vec<RecoveredFile>> {
     let all_entries = dir_entry::scan_all_directories(reader, bpb, fat)?;
     let mut recovered = Vec::new();
@@ -55,6 +57,11 @@ pub fn scan_deleted(
             continue;
         }
 
+        // AI confidence scoring
+        let ai_score = compute_ai_score(
+            ai_engine, reader, bpb, &clusters, full.entry.file_size, &confidence,
+        );
+
         recovered.push(RecoveredFile {
             name,
             dir_path: full.dir_path.clone(),
@@ -62,6 +69,7 @@ pub fn scan_deleted(
             start_cluster: start,
             clusters,
             confidence,
+            ai_score,
         });
     }
 
@@ -70,6 +78,60 @@ pub fn scan_deleted(
         recovered.len()
     );
     Ok(recovered)
+}
+
+/// Compute AI recovery confidence score if an engine is available.
+fn compute_ai_score(
+    ai_engine: Option<&AiEngine>,
+    reader: &dyn DiskReader,
+    bpb: &Bpb,
+    clusters: &[u32],
+    file_size: u32,
+    confidence: &Confidence,
+) -> Option<f32> {
+    let Some(engine) = ai_engine else {
+        return None;
+    };
+    if !engine.is_enabled() {
+        return None;
+    }
+
+    let cluster_size = bpb.cluster_size as u64;
+    let expected_clusters = (file_size as u64).div_ceil(cluster_size);
+
+    // Read first cluster for entropy and header analysis
+    let first_offset = bpb.cluster_offset(clusters[0]);
+    let mut first_buf = vec![0u8; cluster_size as usize];
+    if reader.read_at(first_offset, &mut first_buf).is_err() {
+        return None;
+    }
+
+    // Check contiguity
+    let contiguous = clusters.windows(2).all(|w| w[1] == w[0] + 1);
+
+    // Check header validity via classifier
+    let sample = &first_buf[..first_buf.len().min(4096)];
+    let features = ai::extract_features(sample, file_size as u64, false);
+    let has_valid_header = engine.classify(&features).is_some();
+
+    let scoring_features = ai::scorer::ScoringFeatures {
+        fat_chain_integrity: match confidence {
+            Confidence::High => 1.0,
+            Confidence::Medium => 0.0,
+            Confidence::Carved => 0.0,
+        },
+        clusters_contiguous: contiguous,
+        size_consistency: if expected_clusters > 0 {
+            clusters.len() as f32 / expected_clusters as f32
+        } else {
+            0.0
+        },
+        first_cluster_entropy: ai::shannon_entropy(sample),
+        has_valid_header,
+        file_size: file_size as u64,
+    };
+
+    engine.score(&scoring_features).map(|r| r.score)
 }
 
 /// Build a contiguous cluster list starting at `start`, up to `count` clusters.

@@ -4,6 +4,7 @@
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 
+use crate::ai::{self, AiEngine};
 use crate::fat32::bpb::Bpb;
 use crate::fat32::fat_table::FatTables;
 use crate::io::DiskReader;
@@ -17,6 +18,7 @@ pub fn carve_files(
     bpb: &Bpb,
     fat: &FatTables,
     signatures: &[FileSignature],
+    ai_engine: Option<&AiEngine>,
 ) -> Result<Vec<CarvedFile>> {
     let free_bitmap = fat.primary.free_cluster_bitmap(bpb.total_data_clusters);
     let cluster_size = bpb.cluster_size as usize;
@@ -71,7 +73,7 @@ pub fn carve_files(
                 offset
             );
 
-            let carved = carve_single(reader, bpb, &free_bitmap, cluster, sig)?;
+            let carved = carve_single(reader, bpb, &free_bitmap, cluster, sig, ai_engine)?;
             if let Some(cf) = carved {
                 // Skip past the carved region
                 let skip = cf.clusters.len() as u32;
@@ -99,6 +101,7 @@ fn carve_single(
     free_bitmap: &[bool],
     start_cluster: u32,
     sig: &FileSignature,
+    ai_engine: Option<&AiEngine>,
 ) -> Result<Option<CarvedFile>> {
     let cluster_size = bpb.cluster_size as usize;
     let max_clusters = (sig.max_size as usize).div_ceil(cluster_size);
@@ -129,12 +132,15 @@ fn carve_single(
             let end = total_data.len() + pos + footer.len();
             total_data.extend_from_slice(&buf);
             let size = end as u64;
+            let (ai_type, ai_confidence) = run_ai_classify(ai_engine, &total_data, size, true);
             return Ok(Some(CarvedFile {
                 signature_name: sig.name.to_string(),
                 extension: sig.extension.to_string(),
                 offset: bpb.cluster_offset(start_cluster),
                 size,
                 clusters,
+                ai_type,
+                ai_confidence,
             }));
         }
 
@@ -147,13 +153,39 @@ fn carve_single(
     }
 
     let size = total_data.len() as u64;
+    let (ai_type, ai_confidence) = run_ai_classify(ai_engine, &total_data, size, sig.footer.is_some());
     Ok(Some(CarvedFile {
         signature_name: sig.name.to_string(),
         extension: sig.extension.to_string(),
         offset: bpb.cluster_offset(start_cluster),
         size,
         clusters,
+        ai_type,
+        ai_confidence,
     }))
+}
+
+/// Run AI classification on carved file data if an engine is available.
+fn run_ai_classify(
+    ai_engine: Option<&AiEngine>,
+    data: &[u8],
+    file_size: u64,
+    has_footer: bool,
+) -> (Option<String>, Option<f32>) {
+    let Some(engine) = ai_engine else {
+        return (None, None);
+    };
+    if !engine.is_enabled() {
+        return (None, None);
+    }
+
+    let sample = &data[..data.len().min(4096)];
+    let features = ai::extract_features(sample, file_size, has_footer);
+
+    match engine.classify(&features) {
+        Some(result) => (Some(result.predicted_type), Some(result.confidence)),
+        None => (None, None),
+    }
 }
 
 /// Find the last occurrence of `needle` in `haystack`.

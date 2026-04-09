@@ -7,6 +7,7 @@ A cross-platform tool to recover deleted files from FAT32 partitions and disk im
 - **Directory-entry scanning** – Parses FAT32 directory structures to find deleted entries and reconstructs files by following the FAT chain (or assuming contiguous allocation when the chain is broken).
 - **Signature-based carving** – Scans unallocated clusters for known file headers/footers to recover files even when no directory entry remains.
 - **Confidence reporting** – Each recovered file is assigned a confidence level (`HIGH`, `MEDIUM`, `CARVED`) so you can prioritize results.
+- **AI-powered analysis** *(optional)* – File type classification and smart confidence scoring using heuristic rules or ONNX models. Supports local inference and cloud backends with a privacy-first design (only statistical feature vectors are ever sent remotely).
 - **Native GUI** – Built with eframe/egui; launch without arguments or with `--gui`.
 - **Raw device access** – Reads directly from physical drives on Windows (`\\.\PhysicalDrive0`) and Linux/macOS (`/dev/sdb1`).
 - **Disk image support** – Works with `.img` / `.dd` image files, with optional partition offset.
@@ -27,7 +28,15 @@ JPEG, PNG, GIF, PDF, ZIP, BMP, MP3, RAR (v4/v5), 7Z, TIFF and more.
 ## Building
 
 ```bash
+# Standard build (no AI)
 cargo build --release
+
+# With AI features (local ONNX + cloud API)
+cargo build --release --features ai
+
+# Individual AI backends
+cargo build --release --features ai-local   # ONNX Runtime only
+cargo build --release --features ai-cloud   # Cloud API only
 ```
 
 The binary is placed in `target/release/fat32-undelete` (or `.exe` on Windows).
@@ -109,6 +118,14 @@ src/
 ├── gui.rs               # eframe/egui graphical interface
 ├── i18n.rs              # Internationalization (English, Italian)
 ├── output.rs            # File writing, summary printing, JSON report
+├── ai/                  # AI subsystem (optional, behind feature flags)
+│   ├── mod.rs           # AiEngine, FileFeatures, feature extraction
+│   ├── config.rs        # AiConfig, AiBackendChoice (Off/Local/Cloud)
+│   ├── classifier.rs    # Heuristic file type classifier (12 profiles)
+│   ├── scorer.rs        # Weighted heuristic confidence scorer
+│   ├── local_backend.rs # ONNX Runtime inference (ai-local feature)
+│   ├── cloud_backend.rs # Cloud API client (ai-cloud feature)
+│   └── model_manager.rs # On-demand model download and caching
 ├── fat32/
 │   ├── bpb.rs           # BIOS Parameter Block (boot sector) parser
 │   ├── dir_entry.rs     # FAT32 directory entry parser
@@ -122,6 +139,30 @@ src/
     ├── dir_scan.rs       # Deleted directory entry scanner
     └── signatures.rs     # Built-in file signature database
 ```
+
+## AI Features
+
+When compiled with `--features ai`, the tool gains two optional analysis capabilities:
+
+| Feature | Description |
+|---------|-------------|
+| **File Classifier** | Identifies carved file types using Shannon entropy, byte distribution, and magic-byte signatures. Falls back to heuristic rules when no ONNX model is available. |
+| **Smart Confidence Scorer** | Evaluates recovery reliability based on FAT chain integrity, cluster contiguity, size consistency, header validity, and entropy profile. |
+
+### Architecture
+
+- **Hybrid runtime** – Choose between `Off`, `Local` (ONNX Runtime), or `Cloud` in the GUI settings panel.
+- **Privacy-first** – Cloud mode sends only statistical feature vectors (entropy, byte distribution, file size). Raw file content is never transmitted. A privacy disclaimer must be accepted before enabling cloud mode.
+- **On-demand models** – ONNX models are downloaded and cached in `~/.fat32-undelete/models/` the first time they are needed.
+- **Backward-compatible** – All AI fields are `Option<T>`, so builds without `--features ai` produce identical output.
+
+### Feature Flags
+
+| Flag | Dependencies | Description |
+|------|-------------|-------------|
+| `ai` | `ort`, `ndarray`, `reqwest` | Enables both local and cloud backends |
+| `ai-local` | `ort`, `ndarray` | ONNX Runtime inference only |
+| `ai-cloud` | `reqwest` | Cloud API client only |
 
 ## License
 

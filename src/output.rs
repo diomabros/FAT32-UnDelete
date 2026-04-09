@@ -170,14 +170,14 @@ pub fn print_summary(
     carved_bytes: u64,
 ) {
     println!();
-    println!("{}", i18n::tr().recovery_summary);
+    println!("{}", i18n::tr("recovery_summary"));
     println!();
 
     if !recovered.is_empty() {
         println!("{}", i18n::dir_scan_files_count(recovered.len()));
         println!(
             "  {:<40} {:>10} {:>10}",
-            i18n::tr().col_name, i18n::tr().col_size, i18n::tr().col_confidence
+            i18n::tr("col_name"), i18n::tr("col_size"), i18n::tr("col_confidence")
         );
         println!("  {}", "-".repeat(62));
         for f in recovered {
@@ -195,7 +195,7 @@ pub fn print_summary(
         println!("{}", i18n::carved_files_count(carved.len()));
         println!(
             "  {:<20} {:>10} {:>14}",
-            i18n::tr().col_type, i18n::tr().col_size, i18n::tr().col_offset
+            i18n::tr("col_type"), i18n::tr("col_size"), i18n::tr("col_offset")
         );
         println!("  {}", "-".repeat(46));
         for f in carved {

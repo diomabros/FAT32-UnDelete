@@ -37,6 +37,9 @@ pub struct RecoveredFile {
     pub start_cluster: u32,
     pub clusters: Vec<u32>,
     pub confidence: Confidence,
+    /// AI-predicted recovery confidence score (0.0–1.0). `None` when AI is disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_score: Option<f32>,
 }
 
 /// A file recovered via signature-based carving.
@@ -47,6 +50,12 @@ pub struct CarvedFile {
     pub offset: u64,
     pub size: u64,
     pub clusters: Vec<u32>,
+    /// AI-predicted file type (may differ from signature_name). `None` when AI is disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_type: Option<String>,
+    /// AI classification confidence (0.0–1.0). `None` when AI is disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_confidence: Option<f32>,
 }
 
 impl RecoveredFile {

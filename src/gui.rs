@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 
+use crate::ai;
+use crate::ai::config::{AiBackendChoice, AiConfig};
 use crate::fat32;
 use crate::i18n;
 use crate::io;
@@ -41,6 +43,10 @@ enum BgMessage {
     Error(String),
     ScanFinished,
     ExtractFinished,
+    AiProgress {
+        current: usize,
+        total: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +114,11 @@ struct App {
     // --- Logs ---
     logs: Vec<String>,
 
+    // --- AI configuration ---
+    ai_config: AiConfig,
+    ai_cloud_key_input: String,
+    show_cloud_disclaimer: bool,
+
     // --- Channel ---
     rx: Option<mpsc::Receiver<BgMessage>>,
 }
@@ -147,6 +158,11 @@ impl Default for App {
             progress_total: 0,
 
             logs: Vec::new(),
+
+            ai_config: AiConfig::default(),
+            ai_cloud_key_input: String::new(),
+            show_cloud_disclaimer: false,
+
             rx: None,
         }
     }
@@ -164,6 +180,7 @@ fn spawn_scan(
     file_types: Vec<String>,
     min_size: Option<u64>,
     max_size: Option<u64>,
+    ai_config: AiConfig,
 ) {
     thread::spawn(move || {
         let run = || -> anyhow::Result<()> {
@@ -172,11 +189,11 @@ fn spawn_scan(
 
             let reader = io::open_reader(&source, offset)?;
 
-            tx.send(BgMessage::Log(i18n::tr().parsing_boot_sector.into()))
+            tx.send(BgMessage::Log(i18n::tr("parsing_boot_sector")))
                 .ok();
             let bpb = fat32::bpb::Bpb::parse(reader.as_ref())?;
 
-            tx.send(BgMessage::Log(i18n::tr().loading_fat_tables.into())).ok();
+            tx.send(BgMessage::Log(i18n::tr("loading_fat_tables"))).ok();
             let fat = fat32::fat_table::FatTables::load(reader.as_ref(), &bpb)?;
             let divergent = fat.divergent_count();
 
@@ -199,15 +216,24 @@ fn spawn_scan(
                 recovery::signatures::filter_signatures(&all, &file_types)
             };
 
+            // Initialize AI engine
+            let ai_engine = ai::AiEngine::new(ai_config);
+            let ai_ref = if ai_engine.is_enabled() {
+                tx.send(BgMessage::Log(i18n::tr("ai_processing"))).ok();
+                Some(&ai_engine)
+            } else {
+                None
+            };
+
             // --- Directory scan ---
             let mut recovered = Vec::new();
             if matches!(mode, Mode::Scan | Mode::All) {
                 tx.send(BgMessage::Log(
-                    i18n::tr().scanning_directories.into(),
+                    i18n::tr("scanning_directories"),
                 ))
                 .ok();
                 recovered =
-                    recovery::dir_scan::scan_deleted(reader.as_ref(), &bpb, &fat)?;
+                    recovery::dir_scan::scan_deleted(reader.as_ref(), &bpb, &fat, ai_ref)?;
 
                 if let Some(min) = min_size {
                     recovered.retain(|f| f.size as u64 >= min);
@@ -221,7 +247,7 @@ fn spawn_scan(
             let mut carved = Vec::new();
             if matches!(mode, Mode::Carve | Mode::All) {
                 tx.send(BgMessage::Log(
-                    i18n::tr().carving_clusters.into(),
+                    i18n::tr("carving_clusters"),
                 ))
                 .ok();
                 carved = recovery::carver::carve_files(
@@ -229,6 +255,7 @@ fn spawn_scan(
                     &bpb,
                     &fat,
                     &signatures,
+                    ai_ref,
                 )?;
 
                 if let Some(min) = min_size {
@@ -323,6 +350,16 @@ fn spawn_extract(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn score_color(score: f32) -> egui::Color32 {
+    if score >= 0.8 {
+        egui::Color32::from_rgb(80, 200, 80)
+    } else if score >= 0.5 {
+        egui::Color32::from_rgb(220, 180, 40)
+    } else {
+        egui::Color32::from_rgb(220, 60, 60)
+    }
+}
 
 fn human_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
@@ -426,9 +463,9 @@ impl eframe::App for App {
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading(i18n::tr().app_title);
+                ui.heading(i18n::tr("app_title"));
                 ui.separator();
-                ui.label(i18n::tr().recovery_tool);
+                ui.label(i18n::tr("recovery_tool"));
             });
         });
 
@@ -437,7 +474,7 @@ impl eframe::App for App {
             .min_height(80.0)
             .default_height(140.0)
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new(i18n::tr().log_label).strong());
+                ui.label(egui::RichText::new(i18n::tr("log_label")).strong());
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
@@ -518,6 +555,15 @@ impl App {
                 BgMessage::ExtractFinished => {
                     self.extracting = false;
                 }
+                BgMessage::AiProgress { current, total } => {
+                    self.logs.push(i18n::fmt(
+                        "ai_progress",
+                        &[
+                            ("current", &current.to_string()),
+                            ("total", &total.to_string()),
+                        ],
+                    ));
+                }
             }
         }
     }
@@ -527,30 +573,31 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn draw_settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading(i18n::tr().settings);
+        ui.heading(i18n::tr("settings"));
         ui.separator();
 
         // --- Language selector ---
-        ui.label(egui::RichText::new(i18n::tr().language_label).strong());
+        ui.label(egui::RichText::new(i18n::tr("language_label")).strong());
         ui.horizontal(|ui| {
-            for &lang in i18n::Language::all() {
+            let current_code = i18n::current_language_code();
+            for (code, name) in &i18n::available_languages() {
                 if ui
-                    .selectable_label(i18n::language() == lang, lang.label())
+                    .selectable_label(current_code == *code, name.as_str())
                     .clicked()
                 {
-                    i18n::set_language(lang);
+                    i18n::set_language(code);
                 }
             }
         });
         ui.add_space(4.0);
 
         // --- Source ---
-        ui.label(egui::RichText::new(i18n::tr().source).strong());
+        ui.label(egui::RichText::new(i18n::tr("source")).strong());
         ui.horizontal(|ui| {
             ui.text_edit_singleline(&mut self.source);
-            if ui.button(i18n::tr().file_btn).clicked() {
+            if ui.button(i18n::tr("file_btn")).clicked() {
                 if let Some(path) = rfd::FileDialog::new()
-                    .set_title(i18n::tr().select_disk_image)
+                    .set_title(i18n::tr("select_disk_image"))
                     .pick_file()
                 {
                     self.source = path.display().to_string();
@@ -559,7 +606,7 @@ impl App {
         });
         // Drive picker
         ui.horizontal(|ui| {
-            ui.label(i18n::tr().or_select_drive);
+            ui.label(i18n::tr("or_select_drive"));
             egui::ComboBox::from_id_salt("drive_picker")
                 .selected_text(if self.source.is_empty() {
                     "—".to_string()
@@ -573,19 +620,19 @@ impl App {
                         }
                     }
                 });
-            if ui.button("↻").on_hover_text(i18n::tr().refresh_drive_list).clicked() {
+            if ui.button("↻").on_hover_text(i18n::tr("refresh_drive_list")).clicked() {
                 // ComboBox re-queries list_drives() on next frame automatically
             }
         });
         ui.add_space(4.0);
 
         // --- Output directory ---
-        ui.label(egui::RichText::new(i18n::tr().output_directory).strong());
+        ui.label(egui::RichText::new(i18n::tr("output_directory")).strong());
         ui.horizontal(|ui| {
             ui.text_edit_singleline(&mut self.output_dir);
-            if ui.button(i18n::tr().browse_btn).clicked() {
+            if ui.button(i18n::tr("browse_btn")).clicked() {
                 if let Some(path) = rfd::FileDialog::new()
-                    .set_title(i18n::tr().select_output_dir)
+                    .set_title(i18n::tr("select_output_dir"))
                     .pick_folder()
                 {
                     self.output_dir = path.display().to_string();
@@ -595,49 +642,97 @@ impl App {
         ui.add_space(4.0);
 
         // --- Offset ---
-        ui.label(egui::RichText::new(i18n::tr().partition_offset).strong());
+        ui.label(egui::RichText::new(i18n::tr("partition_offset")).strong());
         ui.text_edit_singleline(&mut self.offset);
         ui.add_space(4.0);
 
         // --- Mode ---
-        ui.label(egui::RichText::new(i18n::tr().recovery_mode).strong());
+        ui.label(egui::RichText::new(i18n::tr("recovery_mode")).strong());
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.mode, Mode::All, i18n::tr().mode_all);
-            ui.selectable_value(&mut self.mode, Mode::Scan, i18n::tr().mode_scan);
-            ui.selectable_value(&mut self.mode, Mode::Carve, i18n::tr().mode_carve);
+            ui.selectable_value(&mut self.mode, Mode::All, i18n::tr("mode_all"));
+            ui.selectable_value(&mut self.mode, Mode::Scan, i18n::tr("mode_scan"));
+            ui.selectable_value(&mut self.mode, Mode::Carve, i18n::tr("mode_carve"));
         });
         ui.add_space(4.0);
 
         // --- File types ---
-        ui.label(egui::RichText::new(i18n::tr().file_types_label).strong());
+        ui.label(egui::RichText::new(i18n::tr("file_types_label")).strong());
         ui.text_edit_singleline(&mut self.file_types);
         ui.add_space(4.0);
 
         // --- Size filters ---
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
-                ui.label(i18n::tr().min_size_label);
+                ui.label(i18n::tr("min_size_label"));
                 ui.text_edit_singleline(&mut self.min_size);
             });
             ui.vertical(|ui| {
-                ui.label(i18n::tr().max_size_label);
+                ui.label(i18n::tr("max_size_label"));
                 ui.text_edit_singleline(&mut self.max_size);
             });
         });
         ui.add_space(12.0);
 
+        // --- AI Settings ---
+        ui.separator();
+        ui.label(egui::RichText::new(i18n::tr("ai_settings")).strong());
+        ui.add_space(2.0);
+
+        ui.horizontal(|ui| {
+            ui.label(i18n::tr("ai_backend"));
+            ui.selectable_value(&mut self.ai_config.backend, AiBackendChoice::Off, i18n::tr("ai_off"));
+            ui.selectable_value(&mut self.ai_config.backend, AiBackendChoice::Local, i18n::tr("ai_local"));
+            ui.selectable_value(&mut self.ai_config.backend, AiBackendChoice::Cloud, i18n::tr("ai_cloud"));
+        });
+
+        // Cloud disclaimer popup
+        if self.ai_config.backend == AiBackendChoice::Cloud && !self.ai_config.cloud_disclaimer_accepted {
+            self.show_cloud_disclaimer = true;
+        }
+
+        if self.show_cloud_disclaimer {
+            egui::Window::new(i18n::tr("ai_cloud_disclaimer_title"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label(i18n::tr("ai_cloud_disclaimer_body"));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(i18n::tr("ai_accept")).clicked() {
+                            self.ai_config.cloud_disclaimer_accepted = true;
+                            self.show_cloud_disclaimer = false;
+                        }
+                        if ui.button(i18n::tr("ai_decline")).clicked() {
+                            self.ai_config.backend = AiBackendChoice::Off;
+                            self.show_cloud_disclaimer = false;
+                        }
+                    });
+                });
+        }
+
+        if self.ai_config.backend == AiBackendChoice::Cloud {
+            ui.horizontal(|ui| {
+                ui.label(i18n::tr("ai_api_key"));
+                ui.add(egui::TextEdit::singleline(&mut self.ai_cloud_key_input).password(true));
+            });
+            self.ai_config.cloud_api_key = self.ai_cloud_key_input.clone();
+        }
+
+        ui.add_space(8.0);
+
         // --- Action buttons ---
         let busy = self.scanning || self.extracting;
 
         ui.horizontal(|ui| {
-            let scan_btn = ui.add_enabled(!busy && !self.source.is_empty(), egui::Button::new(i18n::tr().scan_btn));
+            let scan_btn = ui.add_enabled(!busy && !self.source.is_empty(), egui::Button::new(i18n::tr("scan_btn")));
             if scan_btn.clicked() {
                 self.start_scan();
             }
 
             let extract_btn = ui.add_enabled(
                 !busy && self.has_selected_files(),
-                egui::Button::new(i18n::tr().recover_btn),
+                egui::Button::new(i18n::tr("recover_btn")),
             );
             if extract_btn.clicked() {
                 self.start_extract();
@@ -649,7 +744,7 @@ impl App {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(i18n::tr().scanning);
+                ui.label(i18n::tr("scanning"));
             });
         }
 
@@ -668,7 +763,7 @@ impl App {
             } else {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(i18n::tr().extracting);
+                    ui.label(i18n::tr("extracting"));
                 });
             }
         }
@@ -685,30 +780,30 @@ impl App {
         if self.has_volume_info {
             ui.add_space(12.0);
             ui.separator();
-            ui.label(egui::RichText::new(i18n::tr().volume_info).strong());
+            ui.label(egui::RichText::new(i18n::tr("volume_info")).strong());
             egui::Grid::new("vol_info").show(ui, |ui| {
-                ui.label(i18n::tr().label_field);
+                ui.label(i18n::tr("label_field"));
                 ui.label(if self.volume_label.is_empty() {
-                    i18n::tr().none_label
+                    i18n::tr("none_label")
                 } else {
-                    &self.volume_label
+                    self.volume_label.clone()
                 });
                 ui.end_row();
 
-                ui.label(i18n::tr().sector_size);
+                ui.label(i18n::tr("sector_size"));
                 ui.label(format!("{}", self.bytes_per_sector));
                 ui.end_row();
 
-                ui.label(i18n::tr().cluster_size_label);
+                ui.label(i18n::tr("cluster_size_label"));
                 ui.label(format!("{}", self.cluster_size));
                 ui.end_row();
 
-                ui.label(i18n::tr().data_clusters);
+                ui.label(i18n::tr("data_clusters"));
                 ui.label(format!("{}", self.total_data_clusters));
                 ui.end_row();
 
                 if self.fat_divergent > 0 {
-                    ui.label(i18n::tr().fat_divergences);
+                    ui.label(i18n::tr("fat_divergences"));
                     ui.colored_label(
                         egui::Color32::from_rgb(255, 180, 50),
                         format!("{}", self.fat_divergent),
@@ -727,7 +822,7 @@ impl App {
         if self.recovered.is_empty() && self.carved.is_empty() {
             ui.centered_and_justified(|ui| {
                 ui.label(
-                    egui::RichText::new(i18n::tr().no_results_hint)
+                    egui::RichText::new(i18n::tr("no_results_hint"))
                         .size(16.0)
                         .color(egui::Color32::GRAY),
                 );
@@ -737,7 +832,7 @@ impl App {
 
         // Summary
         ui.horizontal(|ui| {
-            ui.heading(i18n::tr().results);
+            ui.heading(i18n::tr("results"));
             ui.separator();
             ui.label(i18n::dir_scan_carved_summary(
                 self.recovered.len(),
@@ -748,7 +843,7 @@ impl App {
 
         // Selection controls
         ui.horizontal(|ui| {
-            if ui.button(i18n::tr().select_all).clicked() {
+            if ui.button(i18n::tr("select_all")).clicked() {
                 for s in &mut self.recovered_selected {
                     *s = true;
                 }
@@ -756,7 +851,7 @@ impl App {
                     *s = true;
                 }
             }
-            if ui.button(i18n::tr().deselect_all).clicked() {
+            if ui.button(i18n::tr("deselect_all")).clicked() {
                 for s in &mut self.recovered_selected {
                     *s = false;
                 }
@@ -774,7 +869,7 @@ impl App {
             // --- Recovered files table ---
             if !self.recovered.is_empty() {
                 ui.label(
-                    egui::RichText::new(i18n::tr().dir_scan_recovered)
+                    egui::RichText::new(i18n::tr("dir_scan_recovered"))
                         .strong()
                         .size(14.0),
                 );
@@ -786,11 +881,12 @@ impl App {
                     .show(ui, |ui| {
                         // Header
                         ui.label(egui::RichText::new("").strong());
-                        ui.label(egui::RichText::new(i18n::tr().col_name).strong());
-                        ui.label(egui::RichText::new(i18n::tr().col_path).strong());
-                        ui.label(egui::RichText::new(i18n::tr().col_size).strong());
-                        ui.label(egui::RichText::new(i18n::tr().col_cluster).strong());
-                        ui.label(egui::RichText::new(i18n::tr().col_confidence).strong());
+                        ui.label(egui::RichText::new(i18n::tr("col_name")).strong());
+                        ui.label(egui::RichText::new(i18n::tr("col_path")).strong());
+                        ui.label(egui::RichText::new(i18n::tr("col_size")).strong());
+                        ui.label(egui::RichText::new(i18n::tr("col_cluster")).strong());
+                        ui.label(egui::RichText::new(i18n::tr("col_confidence")).strong());
+                        ui.label(egui::RichText::new(i18n::tr("col_ai_score")).strong());
                         ui.end_row();
 
                         for (i, file) in self.recovered.iter().enumerate() {
@@ -813,6 +909,13 @@ impl App {
                                 }
                             };
                             ui.colored_label(conf_color, format!("{}", file.confidence));
+                            // AI Score column
+                            if let Some(score) = file.ai_score {
+                                let ai_color = score_color(score);
+                                ui.colored_label(ai_color, format!("{:.0}%", score * 100.0));
+                            } else {
+                                ui.label("—");
+                            }
                             ui.end_row();
                         }
                     });
@@ -822,7 +925,7 @@ impl App {
             // --- Carved files table ---
             if !self.carved.is_empty() {
                 ui.label(
-                    egui::RichText::new(i18n::tr().carved_files)
+                    egui::RichText::new(i18n::tr("carved_files"))
                         .strong()
                         .size(14.0),
                 );
@@ -834,10 +937,12 @@ impl App {
                     .show(ui, |ui| {
                         // Header
                         ui.label(egui::RichText::new("").strong());
-                        ui.label(egui::RichText::new(i18n::tr().col_type).strong());
-                        ui.label(egui::RichText::new(i18n::tr().col_extension).strong());
-                        ui.label(egui::RichText::new(i18n::tr().col_size).strong());
-                        ui.label(egui::RichText::new(i18n::tr().col_offset).strong());
+                        ui.label(egui::RichText::new(i18n::tr("col_type")).strong());
+                        ui.label(egui::RichText::new(i18n::tr("col_extension")).strong());
+                        ui.label(egui::RichText::new(i18n::tr("col_size")).strong());
+                        ui.label(egui::RichText::new(i18n::tr("col_offset")).strong());
+                        ui.label(egui::RichText::new(i18n::tr("col_ai_type")).strong());
+                        ui.label(egui::RichText::new(i18n::tr("col_ai_score")).strong());
                         ui.end_row();
 
                         for (i, file) in self.carved.iter().enumerate() {
@@ -848,6 +953,19 @@ impl App {
                             ui.label(&file.extension);
                             ui.label(human_size(file.size));
                             ui.label(format!("{:#X}", file.offset));
+                            // AI Type column
+                            if let Some(ref ai_type) = file.ai_type {
+                                ui.label(ai_type);
+                            } else {
+                                ui.label("—");
+                            }
+                            // AI Confidence column
+                            if let Some(conf) = file.ai_confidence {
+                                let ai_color = score_color(conf);
+                                ui.colored_label(ai_color, format!("{:.0}%", conf * 100.0));
+                            } else {
+                                ui.label("—");
+                            }
                             ui.end_row();
                         }
                     });
@@ -888,6 +1006,7 @@ impl App {
             file_types,
             parse_u64_opt(&self.min_size),
             parse_u64_opt(&self.max_size),
+            self.ai_config.clone(),
         );
     }
 
