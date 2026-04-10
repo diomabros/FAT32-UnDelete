@@ -886,6 +886,7 @@ impl App {
                         ui.label(egui::RichText::new(i18n::tr("col_size")).strong());
                         ui.label(egui::RichText::new(i18n::tr("col_cluster")).strong());
                         ui.label(egui::RichText::new(i18n::tr("col_confidence")).strong());
+                        ui.label(egui::RichText::new(i18n::tr("col_ai_type")).strong());
                         ui.label(egui::RichText::new(i18n::tr("col_ai_score")).strong());
                         ui.end_row();
 
@@ -909,6 +910,12 @@ impl App {
                                 }
                             };
                             ui.colored_label(conf_color, format!("{}", file.confidence));
+                            // AI Type column
+                            if let Some(ref ai_type) = file.ai_type {
+                                ui.label(ai_type);
+                            } else {
+                                ui.label("—");
+                            }
                             // AI Score column
                             if let Some(score) = file.ai_score {
                                 let ai_color = score_color(score);

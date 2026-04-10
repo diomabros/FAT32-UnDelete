@@ -57,8 +57,8 @@ pub fn scan_deleted(
             continue;
         }
 
-        // AI confidence scoring
-        let ai_score = compute_ai_score(
+        // AI classification + confidence scoring
+        let (ai_type, ai_score) = compute_ai_analysis(
             ai_engine, reader, bpb, &clusters, full.entry.file_size, &confidence,
         );
 
@@ -69,6 +69,7 @@ pub fn scan_deleted(
             start_cluster: start,
             clusters,
             confidence,
+            ai_type,
             ai_score,
         });
     }
@@ -80,20 +81,20 @@ pub fn scan_deleted(
     Ok(recovered)
 }
 
-/// Compute AI recovery confidence score if an engine is available.
-fn compute_ai_score(
+/// Compute AI classification and recovery confidence score if an engine is available.
+fn compute_ai_analysis(
     ai_engine: Option<&AiEngine>,
     reader: &dyn DiskReader,
     bpb: &Bpb,
     clusters: &[u32],
     file_size: u32,
     confidence: &Confidence,
-) -> Option<f32> {
+) -> (Option<String>, Option<f32>) {
     let Some(engine) = ai_engine else {
-        return None;
+        return (None, None);
     };
     if !engine.is_enabled() {
-        return None;
+        return (None, None);
     }
 
     let cluster_size = bpb.cluster_size as u64;
@@ -103,16 +104,18 @@ fn compute_ai_score(
     let first_offset = bpb.cluster_offset(clusters[0]);
     let mut first_buf = vec![0u8; cluster_size as usize];
     if reader.read_at(first_offset, &mut first_buf).is_err() {
-        return None;
+        return (None, None);
     }
 
     // Check contiguity
     let contiguous = clusters.windows(2).all(|w| w[1] == w[0] + 1);
 
-    // Check header validity via classifier
+    // Classify file type
     let sample = &first_buf[..first_buf.len().min(4096)];
     let features = ai::extract_features(sample, file_size as u64, false);
-    let has_valid_header = engine.classify(&features).is_some();
+    let classification = engine.classify(&features);
+    let ai_type = classification.as_ref().map(|c| c.predicted_type.clone());
+    let has_valid_header = classification.is_some();
 
     let scoring_features = ai::scorer::ScoringFeatures {
         fat_chain_integrity: match confidence {
@@ -131,7 +134,8 @@ fn compute_ai_score(
         file_size: file_size as u64,
     };
 
-    engine.score(&scoring_features).map(|r| r.score)
+    let ai_score = engine.score(&scoring_features).map(|r| r.score);
+    (ai_type, ai_score)
 }
 
 /// Build a contiguous cluster list starting at `start`, up to `count` clusters.

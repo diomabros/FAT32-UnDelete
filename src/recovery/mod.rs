@@ -37,6 +37,9 @@ pub struct RecoveredFile {
     pub start_cluster: u32,
     pub clusters: Vec<u32>,
     pub confidence: Confidence,
+    /// AI-predicted file type (e.g. "JPEG", "PDF"). `None` when AI is disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_type: Option<String>,
     /// AI-predicted recovery confidence score (0.0–1.0). `None` when AI is disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ai_score: Option<f32>,
